@@ -115,6 +115,7 @@ from ministack.core.responses import (
     get_region,
     new_uuid,
 )
+from ministack.services import apigateway_vtl
 from ministack.services.apigateway import (
     _b64url_decode,
     _fetch_jwks,
@@ -2587,9 +2588,17 @@ async def _execute_in_scope(
             authorizer_context=authorizer_context,
             caller_identity=caller_identity,
         )
-    elif int_type in ("HTTP_PROXY", "HTTP"):
+    elif int_type == "HTTP_PROXY":
         return await _invoke_http_proxy_v1(
-            integration, path, method, headers, body, query_params, path_params
+            integration, path, method, headers, body, query_params, path_params,
+            stage=stage,
+        )
+    elif int_type == "HTTP":
+        # Non-proxy: the mapping templates reshape the request and the response
+        # is picked by selectionPattern.
+        return await _invoke_http_custom_v1(
+            integration, path, method, headers, body, query_params, path_params,
+            stage=stage,
         )
     elif int_type == "MOCK":
         return _invoke_mock_v1(integration)
@@ -2890,9 +2899,10 @@ async def _invoke_lambda_custom_v1(
     return _default_integration_response_status_v1(integration), resp_headers, resp_body
 
 
-async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):
-    """Forward a request to an HTTP backend."""
-    uri = integration.get("uri", "")
+async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None,
+                                stage=None):
+    """Forward a request to an HTTP backend unchanged."""
+    uri = _resolve_stage_variables(integration.get("uri", ""), (stage or {}).get("variables"))
     req_params = integration.get("requestParameters", {})
     path_params = path_params or {}
 
@@ -2937,6 +2947,213 @@ async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_
     except Exception:
         # An unresolvable or unreachable backend.
         return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
+
+
+_STAGE_VARIABLE_RE = re.compile(r"\$\{stageVariables\.([A-Za-z0-9_]+)\}")
+
+
+def _resolve_stage_variables(uri, stage_variables):
+    """Substitute ``${stageVariables.name}`` in an integration URI.
+
+    The scheme is always literal in the URI, so only host and path can come out
+    of a stage variable. An unset name resolves to the empty string.
+    """
+    if not uri or "stageVariables." not in uri:
+        return uri
+    variables = stage_variables or {}
+    return _STAGE_VARIABLE_RE.sub(lambda m: str(variables.get(m.group(1), "")), uri)
+
+
+def _substitute_path_params(uri, req_params, path_params):
+    """Replace ``{name}`` placeholders from ``integration.request.path.*``."""
+    for dest, src in (req_params or {}).items():
+        if not dest.startswith("integration.request.path."):
+            continue
+        placeholder = "{" + dest[len("integration.request.path."):] + "}"
+        value = ""
+        if isinstance(src, str):
+            if src.startswith("'") and src.endswith("'"):
+                value = src[1:-1]
+            elif src.startswith("method.request.path."):
+                value = (path_params or {}).get(src[len("method.request.path."):], "")
+        uri = uri.replace(placeholder, value)
+
+    if "{proxy}" in uri:
+        uri = uri.replace("{proxy}", (path_params or {}).get("proxy", ""))
+    return uri
+
+
+def _mapped_request_values(req_params, kind, headers, path_params, query_params, stage_variables):
+    """Resolve the ``integration.request.<kind>.*`` entries into a flat map.
+
+    A value in single quotes is a literal; otherwise it names where to read it
+    from on the method request.
+    """
+    prefix = "integration.request." + kind + "."
+    resolved = {}
+    for dest, src in (req_params or {}).items():
+        if not dest.startswith(prefix):
+            continue
+        name = dest[len(prefix):]
+        value = ""
+        if isinstance(src, str):
+            if src.startswith("'") and src.endswith("'"):
+                value = src[1:-1]
+            elif src.startswith("method.request.header."):
+                value = _header_ci(headers, src[len("method.request.header."):])
+            elif src.startswith("method.request.path."):
+                value = (path_params or {}).get(src[len("method.request.path."):], "")
+            elif src.startswith("method.request.querystring."):
+                raw = (query_params or {}).get(src[len("method.request.querystring."):])
+                value = raw[0] if isinstance(raw, (list, tuple)) and raw else (raw or "")
+            elif src.startswith("stageVariables."):
+                value = (stage_variables or {}).get(src[len("stageVariables."):], "")
+        resolved[name] = str(value)
+    return resolved
+
+
+def _select_request_template(templates, headers):
+    """The template whose key matches the request content type, else the JSON one."""
+    if not templates:
+        return ""
+    content_type = (_header_ci(headers, "content-type")
+                    or "application/json").split(";", 1)[0].strip().lower()
+    for key, value in templates.items():
+        if key.split(";", 1)[0].strip().lower() == content_type:
+            return value
+    return templates.get("application/json") or next(iter(templates.values()), "")
+
+
+def _select_integration_response_v1(integration, status_code):
+    """Pick the integrationResponse for a backend status.
+
+    On an HTTP integration the ``selectionPattern`` is matched against the
+    status code; the entry without a pattern is the default. Several patterns
+    can match, so the entry whose own status code is the backend status wins
+    over a catch-all.
+    """
+    responses = integration.get("integrationResponses") or {}
+    if not responses:
+        return None
+
+    status = str(status_code)
+    matches = []
+    for response in responses.values():
+        pattern = response.get("selectionPattern")
+        if not pattern:
+            continue
+        try:
+            if re.fullmatch(pattern, status):
+                matches.append(response)
+        except re.error:
+            continue
+
+    for response in matches:
+        if str(response.get("statusCode")) == status:
+            return response
+    if matches:
+        return matches[0]
+
+    for response in responses.values():
+        if not response.get("selectionPattern"):
+            return response
+    return next(iter(responses.values()), None)
+
+
+def _response_content_type(resp_headers):
+    try:
+        return resp_headers.get("Content-Type") or "application/json"
+    except AttributeError:
+        return "application/json"
+
+
+async def _invoke_http_custom_v1(
+    integration, path, method, headers, body, query_params, path_params=None,
+    stage=None,
+):
+    """Forward a request to an HTTP backend through its mapping templates.
+
+    Unlike HTTP_PROXY the request is reshaped: the body is whatever
+    ``requestTemplates`` renders, the verb is the integration's own
+    ``httpMethod``, and the response is chosen by ``selectionPattern``. Without
+    that last step every backend status would surface as 200.
+    """
+    stage_variables = (stage or {}).get("variables") or {}
+    path_params = path_params or {}
+    req_params = integration.get("requestParameters") or {}
+
+    uri = _resolve_stage_variables(integration.get("uri", ""), stage_variables)
+    uri = _substitute_path_params(uri, req_params, path_params)
+
+    namespace, context_node = apigateway_vtl.build_namespace(
+        body=body,
+        path_params=path_params,
+        query_params=query_params,
+        headers=headers,
+        stage_variables=stage_variables,
+    )
+
+    template = _select_request_template(integration.get("requestTemplates") or {}, headers)
+    try:
+        rendered = apigateway_vtl.render(template, namespace)
+    except apigateway_vtl.TemplateError:
+        logger.exception("request mapping template failed for %s", uri)
+        return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
+
+    overrides = apigateway_vtl.RequestOverrides(context_node)
+
+    out_headers = _mapped_request_values(
+        req_params, "header", headers, path_params, query_params, stage_variables)
+    out_headers.update(overrides.header)
+
+    # With a request template in play the original query string is not forwarded
+    # wholesale: only what requestParameters and the overrides name.
+    out_query = _mapped_request_values(
+        req_params, "querystring", headers, path_params, query_params, stage_variables)
+    out_query.update(overrides.querystring)
+    if out_query:
+        uri = uri + ("&" if "?" in uri else "?") + urllib.parse.urlencode(out_query)
+
+    payload = rendered.encode("utf-8") if rendered else None
+    http_method = (integration.get("httpMethod") or method or "POST").upper()
+
+    request = urllib.request.Request(uri, data=payload, method=http_method)
+    for name, value in out_headers.items():
+        request.add_header(name, value)
+
+    try:
+        status, resp_headers, resp_body = await _urlopen_async(request, _PROXY_TIMEOUT_SECONDS)
+    except urllib.error.HTTPError as exc:
+        status, resp_headers, resp_body = exc.code, exc.headers, exc.read()
+    except Exception:
+        logger.exception("HTTP integration to %s failed", uri)
+        return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
+
+    content_type = _response_content_type(resp_headers)
+    selected = _select_integration_response_v1(integration, status)
+    if selected is None:
+        return status, {"Content-Type": content_type}, resp_body
+
+    body_text = resp_body.decode("utf-8", "replace") if isinstance(resp_body, bytes) else (resp_body or "")
+    response_template = (selected.get("responseTemplates") or {}).get("application/json")
+    if response_template:
+        response_namespace, _ = apigateway_vtl.build_namespace(
+            body=body_text, stage_variables=stage_variables)
+        try:
+            body_text = apigateway_vtl.render(response_template, response_namespace)
+        except apigateway_vtl.TemplateError:
+            logger.exception("response mapping template failed for %s", uri)
+            return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
+
+    out_resp_headers = {"Content-Type": content_type}
+    for dest, src in (selected.get("responseParameters") or {}).items():
+        if not dest.startswith("method.response.header."):
+            continue
+        name = dest[len("method.response.header."):]
+        if isinstance(src, str) and src.startswith("'") and src.endswith("'"):
+            out_resp_headers[name] = src[1:-1]
+
+    return int(selected.get("statusCode") or status), out_resp_headers, body_text.encode("utf-8")
 
 
 def _invoke_mock_v1(integration):
