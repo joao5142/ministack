@@ -1,0 +1,17 @@
+# Imagem local: a oficial mais as mudancas desta copia. Evita reconstruir a
+# imagem inteira (que depende da imagem doadora de plugins no ghcr) a cada
+# iteracao.
+FROM python:3.13-alpine AS deps
+RUN pip install --no-cache-dir --no-compile "airspeed-ext>=0.6.9"
+
+FROM ministackorg/ministack:latest
+
+COPY --from=deps /usr/local/lib/python3.13/site-packages/airspeed \
+                 /usr/local/lib/python3.13/site-packages/airspeed
+
+COPY ministack/services/apigateway_vtl.py /opt/ministack/ministack/services/apigateway_vtl.py
+COPY ministack/services/apigateway_v1.py  /opt/ministack/ministack/services/apigateway_v1.py
+
+# Os .pyc da imagem oficial sao mais novos que os .py copiados; sem remove-los o
+# PYTHONOPTIMIZE=2 continuaria carregando o bytecode antigo.
+RUN rm -rf /opt/ministack/ministack/services/__pycache__
