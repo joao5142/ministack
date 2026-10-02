@@ -1,6 +1,5 @@
-# Imagem local: a oficial mais as mudancas desta copia. Evita reconstruir a
-# imagem inteira (que depende da imagem doadora de plugins no ghcr) a cada
-# iteracao.
+# Local image: the official one plus the changes in this copy. It avoids
+# rebuilding the whole image, which depends on the plugin donor image on ghcr.
 FROM python:3.13-alpine AS deps
 RUN pip install --no-cache-dir --no-compile "airspeed-ext>=0.6.9"
 
@@ -9,9 +8,10 @@ FROM ministackorg/ministack:latest
 COPY --from=deps /usr/local/lib/python3.13/site-packages/airspeed \
                  /usr/local/lib/python3.13/site-packages/airspeed
 
-COPY ministack/services/apigateway_vtl.py /opt/ministack/ministack/services/apigateway_vtl.py
-COPY ministack/services/apigateway_v1.py  /opt/ministack/ministack/services/apigateway_v1.py
+# The whole package, not file by file: copying only what changed once left a fix
+# out.
+COPY ministack/ /opt/ministack/ministack/
 
-# Os .pyc da imagem oficial sao mais novos que os .py copiados; sem remove-los o
-# PYTHONOPTIMIZE=2 continuaria carregando o bytecode antigo.
-RUN rm -rf /opt/ministack/ministack/services/__pycache__
+# The .pyc files in the official image are newer than the .py files copied over;
+# without removing them PYTHONOPTIMIZE=2 would keep loading the old bytecode.
+RUN find /opt/ministack/ministack -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
