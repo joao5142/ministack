@@ -768,17 +768,48 @@ async def _send_if_handled(send, response, receive=None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _handle_options_request(method: str, request_id: str):
+# Origins allowed to call the control plane cross-site. "*" keeps the open
+# behaviour. It does not affect the data plane (execute-api, Function URL and
+# custom domain), which carries its own CORS from the API configuration.
+MINISTACK_CORS_ORIGINS = [
+    o.strip() for o in os.environ.get("MINISTACK_CORS_ORIGINS", "*").split(",") if o.strip()
+]
+
+
+def _control_plane_cors(headers: dict | None) -> dict:
+    """CORS headers for the AWS API itself.
+
+    With origins configured, only those are echoed back. Open to any origin, a
+    page in the browser reads and writes the whole emulated AWS API, which does
+    not validate signatures.
+    """
+    if "*" in MINISTACK_CORS_ORIGINS:
+        allow = "*"
+    else:
+        h = headers or {}
+        origin = h.get("origin") or h.get("Origin")
+        if not origin or origin not in MINISTACK_CORS_ORIGINS:
+            return {}
+        allow = origin
+    out = {
+        "Access-Control-Allow-Origin": allow,
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "*",
+    }
+    if allow != "*":
+        out["Vary"] = "Origin"
+    return out
+
+
+def _handle_options_request(method: str, request_id: str, headers: dict | None = None):
     """Return the standard CORS preflight response when applicable."""
     if method != "OPTIONS":
         return None
     return (
         200,
         {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Expose-Headers": "*",
+            **_control_plane_cors(headers),
             "Access-Control-Max-Age": "86400",
             "Content-Length": "0",
             "x-amzn-requestid": request_id,
@@ -1192,7 +1223,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         or _parse_cloudfront_dataplane_host(host) is not None
     )
     for response in (
-        None if owns_cors else _handle_options_request(method, request_id),
+        None if owns_cors else _handle_options_request(method, request_id, headers),
         _handle_health_request(path, request_id),
         _handle_ready_request(path, request_id),
         _handle_unknown_localstack_request(path, request_id),
@@ -2622,10 +2653,7 @@ async def _dispatch_service_request(
 
     resp_headers.update(
         {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Expose-Headers": "*",
+            **_control_plane_cors(headers),
             "x-amzn-requestid": request_id,
             "x-amz-request-id": request_id,
             "x-amz-id-2": base64.b64encode(os.urandom(48)).decode(),
