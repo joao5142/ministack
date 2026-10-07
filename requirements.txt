@@ -4,3 +4,5 @@ cbor2>=5.4.0
 # Pinned to the version the images carry, so a pip install and a Docker run
 # classify requests against identical service models.
 botocore==1.43.106
+# Velocity engine behind the API Gateway mapping templates.
+airspeed-ext>=0.6.9

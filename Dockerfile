@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir --no-compile \
         "boto3>=1.34" \
         "jsonata-python>=0.7.0" \
         "graphql-core==3.2.12" \
+        "airspeed-ext>=0.6.9" \
         "botocore==1.43.106" \
         "docutils>=0.18.1,<=0.19" \
         "colorama>=0.2.5,<0.4.7" \

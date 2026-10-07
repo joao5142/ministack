@@ -41,6 +41,10 @@ dependencies = [
     # GraphQL implementation rather than by regular expressions. Pure Python, no
     # transitive dependencies. Pinned: a parser change is a behaviour change.
     "graphql-core==3.2.12",
+    # API Gateway (and AppSync) mapping templates are Velocity. This fork of
+    # airspeed targets AWS' own VTL behaviour rather than the Velocity spec.
+    # Pure Python, no transitive dependencies.
+    "airspeed-ext>=0.6.9",
 ]
 
 [project.optional-dependencies]
