@@ -1,0 +1,17 @@
+# Local image: the official one plus the changes in this copy. It avoids
+# rebuilding the whole image, which depends on the plugin donor image on ghcr.
+FROM python:3.13-alpine AS deps
+RUN pip install --no-cache-dir --no-compile "airspeed-ext>=0.6.9"
+
+FROM ministackorg/ministack:latest
+
+COPY --from=deps /usr/local/lib/python3.13/site-packages/airspeed \
+                 /usr/local/lib/python3.13/site-packages/airspeed
+
+# The whole package, not file by file: copying only what changed once left a fix
+# out.
+COPY ministack/ /opt/ministack/ministack/
+
+# The .pyc files in the official image are newer than the .py files copied over;
+# without removing them PYTHONOPTIMIZE=2 would keep loading the old bytecode.
+RUN find /opt/ministack/ministack -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
