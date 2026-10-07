@@ -4345,7 +4345,9 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
     if runtime.startswith("python"):
         name, shim_handler, source = "_msctx_shim.py", "_msctx_shim.handler", _PY_CTX_ARN_SHIM
     elif runtime.startswith("nodejs"):
-        name, shim_handler, source = "_msctx_shim.js", "_msctx_shim.handler", _JS_CTX_ARN_SHIM
+        # .cjs rather than .js: the shim uses require, and a handler whose
+        # package.json declares "type": "module" would make Node treat it as ESM.
+        name, shim_handler, source = "_msctx_shim.cjs", "_msctx_shim.handler", _JS_CTX_ARN_SHIM
     else:
         return None
     shim_path = os.path.join(code_dir, name)
@@ -5633,7 +5635,10 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 module_name = module_name.replace("/", ".")
 
             if is_node:
-                wrapper_path = os.path.join(tmpdir, "_wrapper.js")
+                # .cjs rather than .js: a handler whose package.json declares
+                # "type": "module" would make Node treat the wrapper as ESM, and
+                # its first line uses require.
+                wrapper_path = os.path.join(tmpdir, "_wrapper.cjs")
                 with open(wrapper_path, "w") as wf:
                     wf.write(_NODE_WRAPPER_SCRIPT)
             else:
